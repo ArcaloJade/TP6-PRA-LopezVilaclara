@@ -21,9 +21,21 @@ def closest_point_matching(X, P):
   P_matched -- reordered P, so that the elements in P match the elements in X
   """
   
-  P_matched = P
+  # P_matched = P
+  P_matched = P.copy()   # Uso copy, si pongo lo de arriba se modifica P cuando modifico P_matched
 
-  #TODO: implement
+  used = set()
+
+  for i in range(X.shape[1]):
+      x = X[:, i]
+
+      dists = [np.linalg.norm(x - P[:, j]) if j not in used else np.inf
+               for j in range(P.shape[1])]
+
+      j_min = np.argmin(dists)
+      used.add(j_min)
+
+      P_matched[:, i] = P[:, j_min]
     
   return P_matched
   
@@ -79,7 +91,9 @@ def icp(X, P, matching_flag=True):
     #calculate rotation and translation
     R = np.dot(U,V)
     
-    #TODO: Check for reflection and correct if necessary
+    if np.linalg.det(R) < 0:
+      V[-1, :] *= -1
+      R = np.dot(U, V)
     
     t = mx-np.dot(R,mp)
     
@@ -121,9 +135,9 @@ def main():
   
   #execute icp
   icp(X,P1,False)
-  #icp(X,P2,False)
-  #icp(X,P3,True)
-  #icp(X,P4,True)
+  icp(X,P2,False)
+  icp(X,P3,True)
+  icp(X,P4,True)
     
 if __name__ == "__main__":
   main()
