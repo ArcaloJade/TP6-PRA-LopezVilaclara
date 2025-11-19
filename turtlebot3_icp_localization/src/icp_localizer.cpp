@@ -178,6 +178,11 @@ private:
         // Magnitud de rotación para criterio de convergencia
         float angle = std::acos( std::min(1.0f, std::max(-1.0f, (R.trace() - 1) / 2.0f)) );
 
+        if (angle < 0.15f) // < ~8.5° → convergió
+        {
+            converged = true;
+        }
+
         return T;
     }
 
