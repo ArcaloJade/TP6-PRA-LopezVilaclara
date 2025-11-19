@@ -13,8 +13,22 @@ def get_neighborhood(cell, occ_map_shape):
 
   neighbors = []
   
-  '''your code here'''
-  '''***        ***'''
+  y, x = cell
+  ny, nx = occ_map_shape
+
+  offsets = [
+    (-1, -1), (-1, 0), (-1, 1),
+    ( 0, -1),          ( 0, 1),
+    ( 1, -1), ( 1, 0), ( 1, 1)
+  ]
+
+  for dy, dx in offsets:
+    ny_ = y + dy
+    nx_ = x + dx
+
+    # Casos bordes
+    if 0 <= ny_ < ny and 0 <= nx_ < nx:
+      neighbors.append((ny_, nx_))
 
 
 
@@ -35,11 +49,22 @@ def get_edge_cost(parent, child, occ_map):
   
   edge_cost = 0
   
-  '''your code here'''
-  '''***        ***'''
+  threshold = 0.5  # Umbral para considerar si está ocupada la celda o no
+  k = 5.0 # Peso que le doy a la probabilidad de que esté ocupada cuando calculo el costo
+
+  py, px = parent
+  cy, cx = child
+
+  if occ_map[py, px] > threshold or occ_map[cy, cx] > threshold:
+    return float('inf') # Costo infinito por moverse a través de un obstáculo
+
+  dy = cy - py
+  dx = cx - px
+  geom_cost = (dy**2 + dx**2)**0.5 # Defino el costo como la distancia euclídea
+  occ_cost = k * occ_map[cy, cx]
 
 
-  return edge_cost
+  return geom_cost * occ_cost
 
 def get_heuristic(cell, goal):
   '''
@@ -104,7 +129,7 @@ def run_path_planning(occ_map, start, goal):
   closed_flags = np.zeros(occ_map.shape)
   
   # store predecessors for each visited cell 
-  predecessors = -np.ones(occ_map.shape + (2,), dtype=np.int)
+  predecessors = -np.ones(occ_map.shape + (2,), dtype=int)
 
   # heuristic for A*
   heuristic = np.zeros(occ_map.shape)
@@ -134,11 +159,30 @@ def run_path_planning(occ_map, start, goal):
     closed_flags[x, y] = 1;
     
     # update costs and predecessor for neighbors
-    '''your code here'''
-    '''***        ***'''
 
+    neighbors = get_neighborhood(parent, occ_map.shape)
 
+    for child in neighbors:
+      cy, cx = child
+        
+      # No actualizo si el nodo hijo ya está cerrado
+      if closed_flags[cy, cx] == 1:
+        continue
 
+      # Calculo el costo de arco
+      edge_cost = get_edge_cost(parent, child, occ_map)
+
+      # Si la celda es intransitable, saltar
+      if edge_cost == float('inf'):
+        continue
+
+      # Costo acumulado desde el inicio hasta child
+      new_cost = costs[parent[0], parent[1]] + edge_cost
+
+      # Actualizar si el nuevo costo es menor
+      if new_cost < costs[cy, cx]:
+        costs[cy, cx] = new_cost
+        predecessors[cy, cx] = parent
 
     #visualize grid cells that have been expanded
     plot_expanded(parent, start, goal)
@@ -152,12 +196,12 @@ def run_path_planning(occ_map, start, goal):
       path_length += np.linalg.norm(parent - predecessor)
       parent = predecessor
 
-    print "found goal     : " + str(parent) 
-    print "cells expanded : " + str(np.count_nonzero(closed_flags))
-    print "path cost      : " + str(costs[goal[0], goal[1]])
-    print "path length    : " + str(path_length)
+    print("found goal     : " + str(parent) )
+    print("cells expanded : " + str(np.count_nonzero(closed_flags)) )
+    print("path cost      : " + str(costs[goal[0], goal[1]]) )
+    print("path length    : " + str(path_length) )
   else:
-    print "no valid path found"
+    print("no valid path found")
 
   #plot the costs 
   plot_costs(costs)

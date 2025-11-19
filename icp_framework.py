@@ -44,7 +44,7 @@ def plot_icp(X, P, P0, i, e):
   
   plt.cla()
   plt.scatter(X[0,:],X[1,:],c='b',marker='o',s=50)
-  plt.scatter(P[0,:],P[1,:],c='m',marker='o',s=50)
+  plt.scatter(P[0,:],P[1,:],c='lime',marker='o',s=50) # Lo cambio a verde porque soy muy daltónico
   plt.scatter(P0[0,:],P0[1,:],c='r',marker='o',s=50)
   plt.legend(('X','P','P0'),loc='lower left')
   plt.plot(np.vstack((X[0,:],P[0,:])),np.vstack((X[1,:],P[1,:])),c='k')
