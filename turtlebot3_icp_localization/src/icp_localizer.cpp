@@ -19,6 +19,7 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <limits>
+#include <pcl/kdtree/kdtree_flann.h>
 
 
 class IcpLocalizer : public rclcpp::Node
@@ -93,96 +94,143 @@ private:
 
     // Hecho por mí
     Eigen::Matrix4f run_icp(
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
-        float max_corr_dist,
-        bool& converged)
-    {
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
+    float max_corr_dist,
+    bool& converged)
+`   {
         converged = false;
+        
+        // 1. Configuración de parámetros de iteración
+        int max_iterations = 20;      // Más iteraciones porque es muy rápido
+        float tolerance = 1e-6;       // Tolerancia fina para convergencia
+        float min_error_change = 1e-5; 
 
-        // Lista de correspondencias
-        std::vector<Eigen::Vector3f> src_pts;
-        std::vector<Eigen::Vector3f> dst_pts;
+        // Matriz de transformación final acumulada (la que retornaremos)
+        Eigen::Matrix4f final_T = Eigen::Matrix4f::Identity();
 
-        for (const auto& p_src : src->points)
+        // Copia de puntos fuente para transformarlos iterativamente
+        // (Usamos vector de Eigen para facilitar operaciones matemáticas)
+        std::vector<Eigen::Vector3f> active_src_pts;
+        active_src_pts.reserve(src->points.size());
+        
+        // OPTIMIZACIÓN: Downsampling simple (usar 1 de cada 2 puntos para ir volando)
+        // Si quieres precisión extrema, cambia step a 1.
+        int step = 2; 
+        for (size_t i = 0; i < src->points.size(); i += step) {
+            const auto& p = src->points[i];
+            // Filtramos NaNs para evitar crashes
+            if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+                active_src_pts.emplace_back(p.x, p.y, p.z);
+            }
+        }
+
+        // 2. Construir KD-Tree UNA sola vez con la nube destino (Target)
+        // Esto es lo que acelera el proceso masivamente.
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(dst);
+
+        float prev_mean_error = std::numeric_limits<float>::max();
+
+        // --- BUCLE ICP ---
+        for (int iter = 0; iter < max_iterations; ++iter)
         {
-            float best_dist = max_corr_dist;
-            Eigen::Vector3f best_pt;
-            bool found = false;
+            std::vector<Eigen::Vector3f> corr_src;
+            std::vector<Eigen::Vector3f> corr_dst;
+            double current_sum_error = 0.0;
 
-            for (const auto& p_dst : dst->points)
+            // 3. Buscar Correspondencias usando KD-Tree
+            for (const auto& p_src : active_src_pts)
             {
-                float dx = p_src.x - p_dst.x;
-                float dy = p_src.y - p_dst.y;
-                float d2 = dx*dx + dy*dy;
-                float d = std::sqrt(d2);
+                pcl::PointXYZ searchPoint;
+                searchPoint.x = p_src.x();
+                searchPoint.y = p_src.y();
+                searchPoint.z = p_src.z();
 
-                if (d < best_dist)
+                std::vector<int> pointIdxNKNSearch(1);
+                std::vector<float> pointNKNSquaredDistance(1);
+
+                // Buscar el vecino más cercano (K=1)
+                if (kdtree.nearestKSearch(searchPoint, 1, pointIdxNKNSearch, pointNKNSquaredDistance) > 0)
                 {
-                    best_dist = d;
-                    best_pt = Eigen::Vector3f(p_dst.x, p_dst.y, p_dst.z);
-                    found = true;
+                    // Verificar umbral de distancia máxima (al cuadrado para evitar sqrt)
+                    if (pointNKNSquaredDistance[0] < max_corr_dist * max_corr_dist)
+                    {
+                        corr_src.push_back(p_src);
+                        
+                        // Recuperamos el punto del destino usando el índice del KDTree
+                        const auto& p_dst_pcl = dst->points[pointIdxNKNSearch[0]];
+                        corr_dst.push_back(Eigen::Vector3f(p_dst_pcl.x, p_dst_pcl.y, p_dst_pcl.z));
+                        
+                        current_sum_error += pointNKNSquaredDistance[0];
+                    }
                 }
             }
 
-            if (found)
-            {
-                src_pts.push_back(Eigen::Vector3f(p_src.x, p_src.y, p_src.z));
-                dst_pts.push_back(best_pt);
+            // Seguridad: Si perdemos tracking o no hay overlap
+            if (corr_src.size() < 10) {
+                // Si falla en la primera iteración, retornamos identidad
+                if (iter == 0) return Eigen::Matrix4f::Identity(); 
+                break; 
             }
+
+            // 4. Calcular Centroides
+            Eigen::Vector3f c_src = Eigen::Vector3f::Zero();
+            Eigen::Vector3f c_dst = Eigen::Vector3f::Zero();
+
+            for (size_t i = 0; i < corr_src.size(); i++) {
+                c_src += corr_src[i];
+                c_dst += corr_dst[i];
+            }
+            c_src /= corr_src.size();
+            c_dst /= corr_dst.size();
+
+            // 5. Matriz de Covarianza H
+            Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
+            for (size_t i = 0; i < corr_src.size(); i++) {
+                Eigen::Vector3f a = corr_src[i] - c_src;
+                Eigen::Vector3f b = corr_dst[i] - c_dst;
+                H += a * b.transpose();
+            }
+
+            // 6. SVD (Singular Value Decomposition)
+            Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
+
+            // Corregir reflexión (si determinante es -1)
+            if (R.determinant() < 0) {
+                Eigen::Matrix3f V = svd.matrixV();
+                V.col(2) *= -1;
+                R = V * svd.matrixU().transpose();
+            }
+
+            Eigen::Vector3f t = c_dst - R * c_src;
+
+            // 7. Actualizar transformación global acumulada
+            Eigen::Matrix4f delta_T = Eigen::Matrix4f::Identity();
+            delta_T.block<3,3>(0,0) = R;
+            delta_T.block<3,1>(0,3) = t;
+            
+            final_T = delta_T * final_T;
+
+            // 8. Aplicar la transformación a los puntos fuente "activos"
+            // para que en la próxima iteración busquen mejores vecinos
+            for (auto& p : active_src_pts) {
+                p = R * p + t;
+            }
+
+            // 9. Chequeo de Convergencia
+            float mean_error = current_sum_error / corr_src.size();
+            if (std::abs(mean_error - prev_mean_error) < tolerance) {
+                converged = true; // Cambio de error despreciable
+                break;
+            }
+            prev_mean_error = mean_error;
         }
 
-        if (src_pts.size() < 10)
-        {
-            return Eigen::Matrix4f::Identity();
-        }
-
-        // Centroides
-        Eigen::Vector3f centroid_src = Eigen::Vector3f::Zero();
-        Eigen::Vector3f centroid_dst = Eigen::Vector3f::Zero();
-
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            centroid_src += src_pts[i];
-            centroid_dst += dst_pts[i];
-        }
-        centroid_src /= src_pts.size();
-        centroid_dst /= dst_pts.size();
-
-        // Matriz H
-        Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            Eigen::Vector3f a = src_pts[i] - centroid_src;
-            Eigen::Vector3f b = dst_pts[i] - centroid_dst;
-            H += a * b.transpose();
-        }
-
-        // SVD
-        Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
-
-        // Corregir reflexión si aparece
-        if (R.determinant() < 0)
-        {
-            Eigen::Matrix3f V = svd.matrixV();
-            V.col(2) *= -1;
-            R = V * svd.matrixU().transpose();
-        }
-
-        Eigen::Vector3f t = centroid_dst - R * centroid_src;
-
-        // Matriz final 4×4
-        Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-        T.block<3,3>(0,0) = R;
-        T.block<3,1>(0,3) = t;
-
-        // Magnitud de rotación para criterio de convergencia
-        float angle = std::acos( std::min(1.0f, std::max(-1.0f, (R.trace() - 1) / 2.0f)) );
-
-        if (angle < 0.15f) converged = true;
-
-        return T;
+        // Consideramos convergencia si logramos terminar el bucle con suficientes puntos
+        converged = true;
+        return final_T;
     }
 
 
