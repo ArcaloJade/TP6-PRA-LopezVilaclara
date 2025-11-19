@@ -15,11 +15,11 @@
 // Add for std::abs
 #include <cmath>
 
-// Agregado por mí
+// Mis includes
 #include <Eigen/Dense>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <vector>
 #include <limits>
-
 
 class IcpLocalizer : public rclcpp::Node
 {
@@ -78,109 +78,184 @@ private:
         curr_cloud_msg.header.frame_id = "odom";
         current_cloud_publisher_->publish(curr_cloud_msg);
 
-        // A partir de acá, esto de scan_callback lo hice yo
-        bool converged;
-        Eigen::Matrix4f transform = run_icp(current_cloud, stable_cloud_, 0.25f, converged);
+        // --- ICP ---
+        // Parameters
+        const int max_iters = 20;
+        const float tolerance = 1e-4f;
+        const float max_correspondence_distance = 0.6f; // metros
+        const float max_rotation_rad = 0.6f; // si la rotación total excede esto => rechazar (≈34°)
+        const float max_translation = 1.0f; // si la traslación excede esto => rechazar
 
-        update_pose(transform);
-        publish_transform();
+        // Prepare kd-tree on stable cloud
+        pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+        kdtree.setInputCloud(stable_cloud_);
 
-        stable_cloud_ = current_cloud;
-        
-        
-    }
+        // Make a working copy of current cloud (we will transform it)
+        pcl::PointCloud<pcl::PointXYZ>::Ptr src_cloud(new pcl::PointCloud<pcl::PointXYZ>(*current_cloud));
+        Eigen::Matrix4f cumulative_transform = Eigen::Matrix4f::Identity();
 
-    // Hecho por mí
-    Eigen::Matrix4f run_icp(
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
-        float max_corr_dist)
-    {
-        converged = false;
-
-        // Lista de correspondencias
-        std::vector<Eigen::Vector3f> src_pts;
-        std::vector<Eigen::Vector3f> dst_pts;
-
-        for (const auto& p_src : src->points)
+        float prev_error = std::numeric_limits<float>::max();
+        for (int iter = 0; iter < max_iters; ++iter)
         {
-            float best_dist = max_corr_dist;
-            Eigen::Vector3f best_pt;
-            bool found = false;
+            std::vector<std::pair<int,int>> correspondences;
+            std::vector<Eigen::Vector3f> src_pts;
+            std::vector<Eigen::Vector3f> tgt_pts;
 
-            for (const auto& p_dst : dst->points)
+            // For each point in source, find nearest neighbor in stable (target)
+            std::vector<int> pointIdxNKNSearch(1);
+            std::vector<float> pointNKNSquaredDistance(1);
+
+            for (size_t i = 0; i < src_cloud->points.size(); ++i)
             {
-                float dx = p_src.x - p_dst.x;
-                float dy = p_src.y - p_dst.y;
-                float d2 = dx*dx + dy*dy;
-                float d = std::sqrt(d2);
+                const pcl::PointXYZ &p = src_cloud->points[i];
+                if (!std::isfinite(p.x) || !std::isfinite(p.y) || std::isnan(p.x)) continue;
 
-                if (d < best_dist)
+                if (kdtree.nearestKSearch(p, 1, pointIdxNKNSearch, pointNKNSquaredDistance) > 0)
                 {
-                    best_dist = d;
-                    best_pt = Eigen::Vector3f(p_dst.x, p_dst.y, p_dst.z);
-                    found = true;
+                    float dist_sq = pointNKNSquaredDistance[0];
+                    if (dist_sq <= max_correspondence_distance * max_correspondence_distance)
+                    {
+                        int tgt_idx = pointIdxNKNSearch[0];
+                        const pcl::PointXYZ &q = stable_cloud_->points[tgt_idx];
+
+                        src_pts.emplace_back(p.x, p.y, p.z);
+                        tgt_pts.emplace_back(q.x, q.y, q.z);
+                    }
                 }
             }
 
-            if (found)
+            if (src_pts.size() < 3)
             {
-                src_pts.push_back(Eigen::Vector3f(p_src.x, p_src.y, p_src.z));
-                dst_pts.push_back(best_pt);
+                // no enough correspondences; break
+                break;
             }
-        }
 
-        if (src_pts.size() < 10)
-        {
-            return Eigen::Matrix4f::Identity();
-        }
+            // Compute centroids
+            Eigen::Vector3f centroid_src = Eigen::Vector3f::Zero();
+            Eigen::Vector3f centroid_tgt = Eigen::Vector3f::Zero();
+            for (size_t i = 0; i < src_pts.size(); ++i)
+            {
+                centroid_src += src_pts[i];
+                centroid_tgt += tgt_pts[i];
+            }
+            centroid_src /= static_cast<float>(src_pts.size());
+            centroid_tgt /= static_cast<float>(tgt_pts.size());
 
-        // Centroides
-        Eigen::Vector3f centroid_src = Eigen::Vector3f::Zero();
-        Eigen::Vector3f centroid_dst = Eigen::Vector3f::Zero();
+            // Compute cross-covariance matrix H
+            Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
+            for (size_t i = 0; i < src_pts.size(); ++i)
+            {
+                Eigen::Vector3f ps = src_pts[i] - centroid_src;
+                Eigen::Vector3f pt = tgt_pts[i] - centroid_tgt;
+                H += ps * pt.transpose();
+            }
 
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            centroid_src += src_pts[i];
-            centroid_dst += dst_pts[i];
-        }
-        centroid_src /= src_pts.size();
-        centroid_dst /= dst_pts.size();
-
-        // Matriz H
-        Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            Eigen::Vector3f a = src_pts[i] - centroid_src;
-            Eigen::Vector3f b = dst_pts[i] - centroid_dst;
-            H += a * b.transpose();
-        }
-
-        // SVD
-        Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
-
-        // Corregir reflexión si aparece
-        if (R.determinant() < 0)
-        {
+            // SVD
+            Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            Eigen::Matrix3f U = svd.matrixU();
             Eigen::Matrix3f V = svd.matrixV();
-            V.col(2) *= -1;
-            R = V * svd.matrixU().transpose();
+
+            Eigen::Matrix3f R = V * U.transpose();
+            // Ensure proper rotation (determinant == 1)
+            if (R.determinant() < 0)
+            {
+                Eigen::Matrix3f Vt = V;
+                Vt.col(2) *= -1.0f;
+                R = Vt * U.transpose();
+            }
+
+            Eigen::Vector3f t = centroid_tgt - R * centroid_src;
+
+            // Apply this incremental transform to source cloud points
+            for (size_t i = 0; i < src_cloud->points.size(); ++i)
+            {
+                Eigen::Vector3f p(src_cloud->points[i].x, src_cloud->points[i].y, src_cloud->points[i].z);
+                Eigen::Vector3f p_trans = R * p + t;
+                src_cloud->points[i].x = p_trans.x();
+                src_cloud->points[i].y = p_trans.y();
+                src_cloud->points[i].z = p_trans.z();
+            }
+
+            // Update cumulative_transform: T_inc * cumulative
+            Eigen::Matrix4f T_inc = Eigen::Matrix4f::Identity();
+            T_inc.block<3,3>(0,0) = R;
+            T_inc.block<3,1>(0,3) = t;
+            cumulative_transform = T_inc * cumulative_transform;
+
+            // Compute mean error (point-to-point)
+            float mean_error = 0.0f;
+            size_t count_pairs = std::min(src_pts.size(), tgt_pts.size());
+            for (size_t i = 0; i < count_pairs; ++i)
+            {
+                Eigen::Vector3f p_trans = R * src_pts[i] + t; // approximate new position
+                mean_error += (p_trans - tgt_pts[i]).norm();
+            }
+            mean_error /= static_cast<float>(count_pairs);
+
+            if (std::abs(prev_error - mean_error) < tolerance)
+            {
+                break; // converged
+            }
+            prev_error = mean_error;
+        } // end ICP iterations
+
+        // Evaluate cumulative transform (reject if too large)
+        Eigen::Matrix3f R_total = cumulative_transform.block<3,3>(0,0);
+        Eigen::Vector3f t_total = cumulative_transform.block<3,1>(0,3);
+        Eigen::AngleAxisf angle_axis(R_total);
+        float rotation_angle = std::abs(angle_axis.angle());
+        float translation_norm = t_total.norm();
+
+        bool accept = true;
+        if (!std::isfinite(rotation_angle) || rotation_angle > max_rotation_rad) accept = false;
+        if (!std::isfinite(translation_norm) || translation_norm > max_translation) accept = false;
+
+        if (accept)
+        {
+            // Update robot pose
+            update_pose(cumulative_transform);
+
+            // Publish transform for RViz2
+            publish_transform();
+
+            // Publish pose_with_covariance (we keep a naive covariance for demonstration)
+            current_pose_.header.stamp = this->get_clock()->now();
+            current_pose_.header.frame_id = "odom";
+            // set a simple covariance (small values, except z/yaw uncertain)
+            for (int i = 0; i < 36; ++i) current_pose_.pose.covariance[i] = 0.0;
+            current_pose_.pose.covariance[0] = 0.01;  // x
+            current_pose_.pose.covariance[7] = 0.01;  // y
+            current_pose_.pose.covariance[35] = 0.05; // yaw
+            pose_publisher_->publish(current_pose_);
+
+            // Publish transformed current cloud (in odom frame) for visualization
+            pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud(new pcl::PointCloud<pcl::PointXYZ>(*src_cloud));
+            sensor_msgs::msg::PointCloud2 transformed_msg;
+            pcl::toROSMsg(*transformed_cloud, transformed_msg);
+            transformed_msg.header.stamp = this->get_clock()->now();
+            transformed_msg.header.frame_id = "odom";
+            current_cloud_publisher_->publish(transformed_msg);
+
+            // Update stable cloud with the converged cloud (filtered)
+            stable_cloud_ = transformed_cloud;
         }
+        else
+        {
+            // Reject the ICP result: keep stable cloud unchanged.
+            RCLCPP_WARN(this->get_logger(), "ICP rejected: rotation=%.3f rad translation=%.3f m", rotation_angle, translation_norm);
 
-        Eigen::Vector3f t = centroid_dst - R * centroid_src;
+            // Still publish the original (untransformed) current cloud but keep its frame as odom for visualization
+            sensor_msgs::msg::PointCloud2 fallback_msg;
+            pcl::toROSMsg(*current_cloud, fallback_msg);
+            fallback_msg.header.stamp = this->get_clock()->now();
+            fallback_msg.header.frame_id = "odom";
+            current_cloud_publisher_->publish(fallback_msg);
 
-        // Matriz final 4×4
-        Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-        T.block<3,3>(0,0) = R;
-        T.block<3,1>(0,3) = t;
-
-        // Magnitud de rotación para criterio de convergencia
-        float angle = std::acos( std::min(1.0f, std::max(-1.0f, (R.trace() - 1) / 2.0f)) );
-
-        return T;
+            // Do not call update_pose to avoid divergence
+        }
+        
+        stable_cloud_ = current_cloud; // Con la convergencia aprobada, actualizar la nube estable.
     }
-
 
     void update_pose(const Eigen::Matrix4f& transform)
     {
