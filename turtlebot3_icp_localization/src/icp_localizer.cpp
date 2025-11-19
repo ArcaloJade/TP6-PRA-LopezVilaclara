@@ -264,7 +264,9 @@ private:
         tf2::Transform current_transform;
         tf2::fromMsg(current_pose_.pose.pose, current_transform);
 
-        tf2::Transform new_transform = current_transform * incremental_transform;
+        // tf2::Transform new_transform = current_transform * incremental_transform;
+        tf2::Transform new_transform = incremental_transform * current_transform;
+
 
         tf2::toMsg(new_transform, current_pose_.pose.pose);
     }
