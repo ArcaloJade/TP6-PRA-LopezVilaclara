@@ -82,12 +82,13 @@ private:
         bool converged;
         Eigen::Matrix4f transform = run_icp(current_cloud, stable_cloud_, 0.25f, converged);
 
-        update_pose(transform);
-        publish_transform();
+        if (converged) {
+            update_pose(transform);
+            publish_transform();
 
-        stable_cloud_ = current_cloud;
-        
-        
+            stable_cloud_ = current_cloud;
+        }
+               
     }
 
     // Hecho por mí
