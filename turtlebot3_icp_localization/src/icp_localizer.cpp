@@ -47,9 +47,6 @@ public:
 
 private:
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
-    /// #TODO: Ejecuten ICP cada vez que se reciba un nuevo scan: mantendrán stable_cloud como la convergencia de la nube de puntos por ICP
-    /// y actualizarán current_pose_ y current_cloud_publisher_ con la nueva convergencia para filtrar odometría y observar el correcto funcionamiento
-    /// de la nube de puntos en Rviz2. 
     {
         // Convert LaserScan to PointCloud
         sensor_msgs::msg::PointCloud2 cloud_msg;
@@ -79,7 +76,6 @@ private:
         curr_cloud_msg.header.frame_id = "odom";
         current_cloud_publisher_->publish(curr_cloud_msg);
 
-        // A partir de acá, esto de scan_callback lo hice yo
         bool converged;
         Eigen::Matrix4f transform = run_icp(current_cloud, stable_cloud_, 0.25f, converged);
 
@@ -92,54 +88,49 @@ private:
                
     }
 
-    // Hecho por mí
+    // "Hay que modularizar"
     Eigen::Matrix4f run_icp(
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
-    const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
-    float max_corr_dist,
-    bool& converged)
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
+        float max_corr_dist,
+        bool& converged)
     {
         converged = false;
         
-        // 1. Configuración de parámetros de iteración
-        int max_iterations = 20;      // Más iteraciones porque es muy rápido
-        float tolerance = 1e-6;       // Tolerancia fina para convergencia
-        float min_error_change = 1e-5; 
+        // Params
+        int max_iterations = 20;
+        float tolerance = 1e-6;
 
-        // Matriz de transformación final acumulada (la que retornaremos)
+        // Matriz de transformación final acumulada
         Eigen::Matrix4f final_T = Eigen::Matrix4f::Identity();
 
         // Copia de puntos fuente para transformarlos iterativamente
-        // (Usamos vector de Eigen para facilitar operaciones matemáticas)
         std::vector<Eigen::Vector3f> active_src_pts;
         active_src_pts.reserve(src->points.size());
         
-        // OPTIMIZACIÓN: Downsampling simple (usar 1 de cada 2 puntos para ir volando)
-        // Si quieres precisión extrema, cambia step a 1.
+        // esto es un downsample simple para optimizar
         int step = 2; 
         for (size_t i = 0; i < src->points.size(); i += step) {
             const auto& p = src->points[i];
-            // Filtramos NaNs para evitar crashes
             if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
                 active_src_pts.emplace_back(p.x, p.y, p.z);
             }
         }
 
-        // 2. Construir KD-Tree UNA sola vez con la nube destino (Target)
-        // Esto es lo que acelera el proceso masivamente.
+        // Uso KD-tree
         pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
         kdtree.setInputCloud(dst);
 
         float prev_mean_error = std::numeric_limits<float>::max();
 
-        // --- BUCLE ICP ---
+        // ICP como tal
         for (int iter = 0; iter < max_iterations; ++iter)
         {
             std::vector<Eigen::Vector3f> corr_src;
             std::vector<Eigen::Vector3f> corr_dst;
             double current_sum_error = 0.0;
 
-            // 3. Buscar Correspondencias usando KD-Tree
+            // Correspondencias
             for (const auto& p_src : active_src_pts)
             {
                 pcl::PointXYZ searchPoint;
@@ -150,15 +141,15 @@ private:
                 std::vector<int> pointIdxNKNSearch(1);
                 std::vector<float> pointNKNSquaredDistance(1);
 
-                // Buscar el vecino más cercano (K=1)
+                // Vecino más cercano
                 if (kdtree.nearestKSearch(searchPoint, 1, pointIdxNKNSearch, pointNKNSquaredDistance) > 0)
                 {
-                    // Verificar umbral de distancia máxima (al cuadrado para evitar sqrt)
+                    // Verifico el threshold de distancia máxima (al cuadrado para evitar sqrt)
                     if (pointNKNSquaredDistance[0] < max_corr_dist * max_corr_dist)
                     {
                         corr_src.push_back(p_src);
                         
-                        // Recuperamos el punto del destino usando el índice del KDTree
+                        // Recupero el punto del destino usando el índice del KDTree
                         const auto& p_dst_pcl = dst->points[pointIdxNKNSearch[0]];
                         corr_dst.push_back(Eigen::Vector3f(p_dst_pcl.x, p_dst_pcl.y, p_dst_pcl.z));
                         
@@ -167,14 +158,14 @@ private:
                 }
             }
 
-            // Seguridad: Si perdemos tracking o no hay overlap
+            // Si pierdo tracking o no hay overlap...
             if (corr_src.size() < 10) {
-                // Si falla en la primera iteración, retornamos identidad
+                // Si falla en la primera iteración devuelvo la identidad
                 if (iter == 0) return Eigen::Matrix4f::Identity(); 
                 break; 
             }
 
-            // 4. Calcular Centroides
+            // Centroides
             Eigen::Vector3f c_src = Eigen::Vector3f::Zero();
             Eigen::Vector3f c_dst = Eigen::Vector3f::Zero();
 
@@ -185,7 +176,7 @@ private:
             c_src /= corr_src.size();
             c_dst /= corr_dst.size();
 
-            // 5. Matriz de Covarianza H
+            // Matriz de Covarianza H
             Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
             for (size_t i = 0; i < corr_src.size(); i++) {
                 Eigen::Vector3f a = corr_src[i] - c_src;
@@ -193,11 +184,11 @@ private:
                 H += a * b.transpose();
             }
 
-            // 6. SVD (Singular Value Decomposition)
+            // SVD
             Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
             Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
 
-            // Corregir reflexión (si determinante es -1)
+            // Chequeo que no haya reflexión, tiene q ser una rotación si o si
             if (R.determinant() < 0) {
                 Eigen::Matrix3f V = svd.matrixV();
                 V.col(2) *= -1;
@@ -206,20 +197,19 @@ private:
 
             Eigen::Vector3f t = c_dst - R * c_src;
 
-            // 7. Actualizar transformación global acumulada
+            // Actualizo la transformación total
             Eigen::Matrix4f delta_T = Eigen::Matrix4f::Identity();
             delta_T.block<3,3>(0,0) = R;
             delta_T.block<3,1>(0,3) = t;
             
             final_T = delta_T * final_T;
 
-            // 8. Aplicar la transformación a los puntos fuente "activos"
-            // para que en la próxima iteración busquen mejores vecinos
+            // Aplico la transformación a los puntos fuente activos
             for (auto& p : active_src_pts) {
                 p = R * p + t;
             }
 
-            // 9. Chequeo de Convergencia
+            // Me fijo si converge
             float mean_error = current_sum_error / corr_src.size();
             if (std::abs(mean_error - prev_mean_error) < tolerance) {
                 converged = true; // Cambio de error despreciable
@@ -228,7 +218,7 @@ private:
             prev_mean_error = mean_error;
         }
 
-        // Consideramos convergencia si logramos terminar el bucle con suficientes puntos
+        // Considero convergencia si se logra terminar el loop con suficientes puntitos
         converged = true;
         return final_T;
     }
