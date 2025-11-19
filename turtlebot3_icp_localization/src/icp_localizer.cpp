@@ -247,8 +247,6 @@ private:
             fallback_msg.header.stamp = this->get_clock()->now();
             fallback_msg.header.frame_id = "odom";
             current_cloud_publisher_->publish(fallback_msg);
-
-            stable_cloud_ = current_cloud;
         }
         
     }
