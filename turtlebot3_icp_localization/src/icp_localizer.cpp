@@ -98,7 +98,7 @@ private:
     const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
     float max_corr_dist,
     bool& converged)
-`   {
+    {
         converged = false;
         
         // 1. Configuración de parámetros de iteración
