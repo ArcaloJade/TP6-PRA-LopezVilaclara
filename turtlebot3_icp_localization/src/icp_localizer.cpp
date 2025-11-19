@@ -15,11 +15,10 @@
 // Add for std::abs
 #include <cmath>
 
-// Agregado por mí
-#include <Eigen/Dense>
-#include <vector>
+// Mis includes
 #include <limits>
-
+#include <Eigen/Dense>
+#include <Eigen/SVD>
 
 class IcpLocalizer : public rclcpp::Node
 {
@@ -78,114 +77,157 @@ private:
         curr_cloud_msg.header.frame_id = "odom";
         current_cloud_publisher_->publish(curr_cloud_msg);
 
-        bool converged;
-        Eigen::Matrix4f transform = run_icp(current_cloud, stable_cloud_, 0.25f, converged);
-
-        if (converged)
+        // ICP Algorithm
+        const int max_iterations = 20;
+        const double convergence_threshold = 0.01; // radianes (~0.57 grados)
+        const double rmse_threshold = 0.05; // metros
+        
+        pcl::PointCloud<pcl::PointXYZ>::Ptr P_cloud = current_cloud;
+        Eigen::Matrix4f final_transform = Eigen::Matrix4f::Identity();
+        
+        for (int iter = 0; iter < max_iterations; ++iter)
         {
-            update_pose(transform);
-            publish_transform();
-
-            // Actualizamos nube estable SOLO si convergió
-            stable_cloud_ = current_cloud;
+            // 1. Closest Point Matching
+            pcl::PointCloud<pcl::PointXYZ>::Ptr P_matched(new pcl::PointCloud<pcl::PointXYZ>);
+            P_matched->points.resize(stable_cloud_->points.size());
+            
+            for (size_t i = 0; i < stable_cloud_->points.size(); ++i)
+            {
+                const auto& x_point = stable_cloud_->points[i];
+                double min_dist = std::numeric_limits<double>::max();
+                int min_idx = 0;
+                
+                for (size_t j = 0; j < P_cloud->points.size(); ++j)
+                {
+                    const auto& p_point = P_cloud->points[j];
+                    double dist = std::sqrt(
+                        std::pow(x_point.x - p_point.x, 2) +
+                        std::pow(x_point.y - p_point.y, 2) +
+                        std::pow(x_point.z - p_point.z, 2)
+                    );
+                    
+                    if (dist < min_dist)
+                    {
+                        min_dist = dist;
+                        min_idx = j;
+                    }
+                }
+                
+                P_matched->points[i] = P_cloud->points[min_idx];
+            }
+            
+            // 2. Calculate centers of mass
+            Eigen::Vector3f mx(0.0f, 0.0f, 0.0f);
+            Eigen::Vector3f mp(0.0f, 0.0f, 0.0f);
+            
+            for (const auto& point : stable_cloud_->points)
+            {
+                mx[0] += point.x;
+                mx[1] += point.y;
+                mx[2] += point.z;
+            }
+            mx /= static_cast<float>(stable_cloud_->points.size());
+            
+            for (const auto& point : P_matched->points)
+            {
+                mp[0] += point.x;
+                mp[1] += point.y;
+                mp[2] += point.z;
+            }
+            mp /= static_cast<float>(P_matched->points.size());
+            
+            // 3. Subtract centers of mass
+            Eigen::MatrixXf X_prime(3, stable_cloud_->points.size());
+            Eigen::MatrixXf P_prime(3, P_matched->points.size());
+            
+            for (size_t i = 0; i < stable_cloud_->points.size(); ++i)
+            {
+                X_prime(0, i) = stable_cloud_->points[i].x - mx[0];
+                X_prime(1, i) = stable_cloud_->points[i].y - mx[1];
+                X_prime(2, i) = stable_cloud_->points[i].z - mx[2];
+                
+                P_prime(0, i) = P_matched->points[i].x - mp[0];
+                P_prime(1, i) = P_matched->points[i].y - mp[1];
+                P_prime(2, i) = P_matched->points[i].z - mp[2];
+            }
+            
+            // 4. SVD
+            Eigen::Matrix3f W = X_prime * P_prime.transpose();
+            Eigen::JacobiSVD<Eigen::Matrix3f> svd(W, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            Eigen::Matrix3f U = svd.matrixU();
+            Eigen::Matrix3f V = svd.matrixV();
+            
+            // 5. Calculate rotation and translation
+            Eigen::Matrix3f R = U * V.transpose();
+            
+            // Correction for reflection
+            if (R.determinant() < 0)
+            {
+                V.col(2) *= -1;
+                R = U * V.transpose();
+            }
+            
+            Eigen::Vector3f t = mx - R * mp;
+            
+            // 6. Build transformation matrix
+            Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+            transform.block<3, 3>(0, 0) = R;
+            transform.block<3, 1>(0, 3) = t;
+            
+            // 7. Calculate RMSE
+            double rmse = 0.0;
+            for (size_t i = 0; i < stable_cloud_->points.size(); ++i)
+            {
+                Eigen::Vector3f x_vec(stable_cloud_->points[i].x,
+                                      stable_cloud_->points[i].y,
+                                      stable_cloud_->points[i].z);
+                Eigen::Vector3f p_vec(P_matched->points[i].x,
+                                      P_matched->points[i].y,
+                                      P_matched->points[i].z);
+                
+                Eigen::Vector3f p_transformed = R * p_vec + t;
+                rmse += (x_vec - p_transformed).squaredNorm();
+            }
+            rmse = std::sqrt(rmse / stable_cloud_->points.size());
+            
+            // 8. Apply transformation to P_cloud for next iteration
+            pcl::PointCloud<pcl::PointXYZ>::Ptr P_transformed(new pcl::PointCloud<pcl::PointXYZ>);
+            P_transformed->points.resize(P_cloud->points.size());
+            
+            for (size_t i = 0; i < P_cloud->points.size(); ++i)
+            {
+                Eigen::Vector3f p(P_cloud->points[i].x,
+                                  P_cloud->points[i].y,
+                                  P_cloud->points[i].z);
+                Eigen::Vector3f p_new = R * p + t;
+                
+                P_transformed->points[i].x = p_new[0];
+                P_transformed->points[i].y = p_new[1];
+                P_transformed->points[i].z = p_new[2];
+            }
+            
+            P_cloud = P_transformed;
+            final_transform = transform * final_transform;
+            
+            // 9. Check convergence
+            if (rmse < rmse_threshold)
+            {
+                break;
+            }
         }
         
+        // 10. Filter convergence: check rotation angle
+        Eigen::Matrix3f R_final = final_transform.block<3, 3>(0, 0);
+        double rotation_angle = std::acos((R_final.trace() - 1.0) / 2.0);
+        
+        if (std::abs(rotation_angle) < convergence_threshold)
+        {
+            update_pose(final_transform);
+            publish_transform();
+        }
+        
+        stable_cloud_ = P_cloud; // Con la convergencia aprobada, actualizar la nube estable.
     }
-
-    Eigen::Matrix4f run_icp(
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
-        const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
-        float max_corr_dist,
-        bool& converged)
-    {
-        converged = false;
-
-        // Lista de correspondencias
-        std::vector<Eigen::Vector3f> src_pts;
-        std::vector<Eigen::Vector3f> dst_pts;
-
-        for (const auto& p_src : src->points)
-        {
-            float best_dist = max_corr_dist;
-            Eigen::Vector3f best_pt;
-            bool found = false;
-
-            for (const auto& p_dst : dst->points)
-            {
-                float dx = p_src.x - p_dst.x;
-                float dy = p_src.y - p_dst.y;
-                float d2 = dx*dx + dy*dy;
-                float d = std::sqrt(d2);
-
-                if (d < best_dist)
-                {
-                    best_dist = d;
-                    best_pt = Eigen::Vector3f(p_dst.x, p_dst.y, p_dst.z);
-                    found = true;
-                }
-            }
-
-            if (found)
-            {
-                src_pts.push_back(Eigen::Vector3f(p_src.x, p_src.y, p_src.z));
-                dst_pts.push_back(best_pt);
-            }
-        }
-
-        if (src_pts.size() < 10)
-        {
-            return Eigen::Matrix4f::Identity();
-        }
-
-        // Centroides
-        Eigen::Vector3f centroid_src = Eigen::Vector3f::Zero();
-        Eigen::Vector3f centroid_dst = Eigen::Vector3f::Zero();
-
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            centroid_src += src_pts[i];
-            centroid_dst += dst_pts[i];
-        }
-        centroid_src /= src_pts.size();
-        centroid_dst /= dst_pts.size();
-
-        // Matriz H
-        Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
-        for (size_t i = 0; i < src_pts.size(); i++)
-        {
-            Eigen::Vector3f a = src_pts[i] - centroid_src;
-            Eigen::Vector3f b = dst_pts[i] - centroid_dst;
-            H += a * b.transpose();
-        }
-
-        // SVD
-        Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
-
-        // Corregir reflexión si aparece
-        if (R.determinant() < 0)
-        {
-            Eigen::Matrix3f V = svd.matrixV();
-            V.col(2) *= -1;
-            R = V * svd.matrixU().transpose();
-        }
-
-        Eigen::Vector3f t = centroid_dst - R * centroid_src;
-
-        // Matriz final 4×4
-        Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
-        T.block<3,3>(0,0) = R;
-        T.block<3,1>(0,3) = t;
-
-        // Magnitud de rotación para criterio de convergencia
-        float angle = std::acos( std::min(1.0f, std::max(-1.0f, (R.trace() - 1) / 2.0f)) );
-
-        if (angle < 0.15f)  // < ~8.5° → convergió
-            converged = true;
-
-        return T;
-    }
-
 
     void update_pose(const Eigen::Matrix4f& transform)
     {
