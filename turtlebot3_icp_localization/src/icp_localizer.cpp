@@ -15,6 +15,11 @@
 // Add for std::abs
 #include <cmath>
 
+// Agregado por mí
+#include <Eigen/Dense>
+#include <vector>
+#include <limits>
+
 
 class IcpLocalizer : public rclcpp::Node
 {
@@ -73,13 +78,114 @@ private:
         curr_cloud_msg.header.frame_id = "odom";
         current_cloud_publisher_->publish(curr_cloud_msg);
 
-        /// #TODO: Ejecuten ICP: roten la nube de puntos y obtengan la respectiva matriz de transformación, luego usen update_pose
-        /// para actualizar current_pose_ y publish_transform para publicar la transformación en Rviz2. NOTA: No olviden filtrar
-        /// la convergencia de ICP, si la rotación no converge por debajo de un límite de rotación, no actualicen current_pose_, de
-        /// lo contrario divergerá.
+        bool converged;
+        Eigen::Matrix4f transform = run_icp(current_cloud, stable_cloud_, 0.25f, converged);
+
+        if (converged)
+        {
+            update_pose(transform);
+            publish_transform();
+
+            // Actualizamos nube estable SOLO si convergió
+            stable_cloud_ = current_cloud;
+        }
         
-        stable_cloud_ = current_cloud; // Con la convergencia aprobada, actualizar la nube estable.
     }
+
+    Eigen::Matrix4f run_icp(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& src,
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& dst,
+        float max_corr_dist,
+        bool& converged)
+    {
+        converged = false;
+
+        // Lista de correspondencias
+        std::vector<Eigen::Vector3f> src_pts;
+        std::vector<Eigen::Vector3f> dst_pts;
+
+        for (const auto& p_src : src->points)
+        {
+            float best_dist = max_corr_dist;
+            Eigen::Vector3f best_pt;
+            bool found = false;
+
+            for (const auto& p_dst : dst->points)
+            {
+                float dx = p_src.x - p_dst.x;
+                float dy = p_src.y - p_dst.y;
+                float d2 = dx*dx + dy*dy;
+                float d = std::sqrt(d2);
+
+                if (d < best_dist)
+                {
+                    best_dist = d;
+                    best_pt = Eigen::Vector3f(p_dst.x, p_dst.y, p_dst.z);
+                    found = true;
+                }
+            }
+
+            if (found)
+            {
+                src_pts.push_back(Eigen::Vector3f(p_src.x, p_src.y, p_src.z));
+                dst_pts.push_back(best_pt);
+            }
+        }
+
+        if (src_pts.size() < 10)
+        {
+            return Eigen::Matrix4f::Identity();
+        }
+
+        // Centroides
+        Eigen::Vector3f centroid_src = Eigen::Vector3f::Zero();
+        Eigen::Vector3f centroid_dst = Eigen::Vector3f::Zero();
+
+        for (size_t i = 0; i < src_pts.size(); i++)
+        {
+            centroid_src += src_pts[i];
+            centroid_dst += dst_pts[i];
+        }
+        centroid_src /= src_pts.size();
+        centroid_dst /= dst_pts.size();
+
+        // Matriz H
+        Eigen::Matrix3f H = Eigen::Matrix3f::Zero();
+        for (size_t i = 0; i < src_pts.size(); i++)
+        {
+            Eigen::Vector3f a = src_pts[i] - centroid_src;
+            Eigen::Vector3f b = dst_pts[i] - centroid_dst;
+            H += a * b.transpose();
+        }
+
+        // SVD
+        Eigen::JacobiSVD<Eigen::Matrix3f> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3f R = svd.matrixV() * svd.matrixU().transpose();
+
+        // Corregir reflexión si aparece
+        if (R.determinant() < 0)
+        {
+            Eigen::Matrix3f V = svd.matrixV();
+            V.col(2) *= -1;
+            R = V * svd.matrixU().transpose();
+        }
+
+        Eigen::Vector3f t = centroid_dst - R * centroid_src;
+
+        // Matriz final 4×4
+        Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
+        T.block<3,3>(0,0) = R;
+        T.block<3,1>(0,3) = t;
+
+        // Magnitud de rotación para criterio de convergencia
+        float angle = std::acos( std::min(1.0f, std::max(-1.0f, (R.trace() - 1) / 2.0f)) );
+
+        if (angle < 0.15f)  // < ~8.5° → convergió
+            converged = true;
+
+        return T;
+    }
+
 
     void update_pose(const Eigen::Matrix4f& transform)
     {
