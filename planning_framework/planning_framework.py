@@ -66,12 +66,13 @@ def get_edge_cost(parent, child, occ_map):
 
   return geom_cost * occ_cost
 
-def get_heuristic(cell, goal):
+def get_heuristic(cell, goal, h2_factor=1):
   '''
   Estimate cost for moving from cell to goal based on heuristic.
 
   Arguments:
   cell, goal -- cell coordinates as [y, x]
+  h2_factor -- factor por el cual multiplico la heurística calculada
 
   Output:
   cost -- estimated cost
@@ -79,11 +80,22 @@ def get_heuristic(cell, goal):
   
   heuristic = 0
  
-  '''your code here'''
-  '''***        ***'''
+  # Para que A* sea óptimo, la heurística debe:
+  # 1. Ser admisible, osea que nunca debe sobreestimar el costo real para llegar al objetivo.
+  # 2. Ser consistente, lo cual es que para cada nodo parent n y su/s hijo/s n', la estimación heurística 
+  #    de n debe ser menor o igual al costo del arco de n a n' más la estimación heurística de n'.
+  #    Igual, si una heurística es consistente, entonces es admisible también.
 
+  # Multiplicar la heurística, en este caso por el h2_factor, cambia el comportamiento del A*:
+  # - Si h2_factor = 1, A* es óptimo y usa la heurística admisible, expandiendo más nodos en general y garantizando el camino de menor costo.
+  # - Si h2_factor > 1, como vi con los valores probados 2, 5 y 10, A* pierde optimalidad y expande menos nodos, priorizando la velocidad de
+  #   búsqueda del goal sobre la calidad del camino encontrado. Puede ser que encuentre caminos más cortos, pero el costo total de estos es mayor.
 
-  return heuristic
+  y, x = cell
+  gy, gx = goal
+  heuristic = np.sqrt((y - gy)**2 + (x - gx)**2)
+
+  return h2_factor * heuristic
 
 def plot_map(occ_map, start, goal):
   plt.imshow(occ_map.T, cmap=plt.cm.gray, interpolation='none', origin='upper')
@@ -135,7 +147,7 @@ def run_path_planning(occ_map, start, goal):
   heuristic = np.zeros(occ_map.shape)
   for x in range(occ_map.shape[0]):
     for y in range(occ_map.shape[1]):
-      heuristic[x, y] = get_heuristic([x, y], goal)
+      heuristic[x, y] = get_heuristic([x, y], goal, h2_factor=1)
 
   # start search
   parent = start
