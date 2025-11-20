@@ -91,6 +91,7 @@ def icp(X, P, matching_flag=True):
     #calculate rotation and translation
     R = np.dot(U,V)
     
+    # Check for reflection and correct if necessary
     if np.linalg.det(R) < 0:
       V[-1, :] *= -1
       R = np.dot(U, V)

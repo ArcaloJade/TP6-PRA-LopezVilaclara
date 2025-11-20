@@ -91,6 +91,30 @@ def get_heuristic(cell, goal, h2_factor=1):
   # - Si h2_factor > 1, como vi con los valores probados 2, 5 y 10, A* pierde optimalidad y expande menos nodos, priorizando la velocidad de
   #   búsqueda del goal sobre la calidad del camino encontrado. Puede ser que encuentre caminos más cortos, pero el costo total de estos es mayor.
 
+  # Con h2_factor = 1:
+  # found goal : [22 33]
+  # cells expanded : 48
+  # path cost : 0.446234575416034
+  # path length : 48.87005768508879 
+  #
+  # Con h2_factor = 2:
+  # found goal : [22 33] 
+  # cells expanded : 49 
+  # path cost : 1.0011855991920424 
+  # path length : 48.87005768508879
+  #  
+  # Con h2_factor = 5: 
+  # found goal : [22 33] 
+  # cells expanded : 44 
+  # path cost : 10.391147448317197 
+  # path length : 42.28427124746189 
+  #
+  # Con h2_factor = 10:
+  # found goal : [22 33] 
+  # cells expanded : 39 
+  # path cost : 10.391147448317197 
+  # path length : 42.28427124746189
+
   y, x = cell
   gy, gx = goal
   heuristic = np.sqrt((y - gy)**2 + (x - gx)**2)
